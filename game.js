@@ -308,68 +308,42 @@
   function startSpinSound(ctx) {
     if (!ctx || ctx.state !== "running") return () => {};
 
-    // Continuous filtered noise gives the reels a mechanical "whirr" for the
-    // entire spin instead of only playing two short tones at the beginning.
-    const bufferLength = Math.max(1, Math.floor(ctx.sampleRate * .35));
-    const noiseBuffer = ctx.createBuffer(1, bufferLength, ctx.sampleRate);
-    const data = noiseBuffer.getChannelData(0);
-    for (let i = 0; i < data.length; i++) {
-      data[i] = (Math.random() * 2 - 1) * .75;
-    }
-
-    const noise = ctx.createBufferSource();
-    noise.buffer = noiseBuffer;
-    noise.loop = true;
-
-    const filter = ctx.createBiquadFilter();
-    filter.type = "bandpass";
-    filter.frequency.setValueAtTime(950, ctx.currentTime);
-    filter.Q.setValueAtTime(.8, ctx.currentTime);
-
-    const noiseGain = ctx.createGain();
-    noiseGain.gain.setValueAtTime(0.0001, ctx.currentTime);
-    noiseGain.gain.exponentialRampToValueAtTime(.032, ctx.currentTime + .06);
-
-    // A quiet low oscillator adds a motor-like undertone.
-    const motor = ctx.createOscillator();
-    const motorGain = ctx.createGain();
-    motor.type = "sawtooth";
-    motor.frequency.setValueAtTime(82, ctx.currentTime);
-    motorGain.gain.setValueAtTime(0.0001, ctx.currentTime);
-    motorGain.gain.exponentialRampToValueAtTime(.012, ctx.currentTime + .06);
-
-    noise.connect(filter).connect(noiseGain).connect(ctx.destination);
-    motor.connect(motorGain).connect(ctx.destination);
-    noise.start();
-    motor.start();
-
-    // Soft repeating clicks make the sound read as spinning reels rather than
-    // a steady background tone. They continue until the last reel stops.
-    let tick = 0;
-    const tickTimer = window.setInterval(() => {
-      if (ctx.state !== "running") return;
-      const frequencies = [520, 590, 555, 625];
-      toneWithContext(ctx, frequencies[tick % frequencies.length], .038, .016, "square");
-      tick += 1;
-    }, 105);
-
+    // V1.8: use short mechanical reel ticks only. The previous version used
+    // continuous filtered noise + a low oscillator, which could sound like a
+    // fan/buzz on tablet speakers.
     let stopped = false;
+    let tickTimer = null;
+    let tick = 0;
+
+    const frequencies = [470, 525, 495, 560, 510, 445];
+
+    const scheduleTick = () => {
+      if (stopped || ctx.state !== "running") return;
+
+      const f = frequencies[tick % frequencies.length];
+      toneWithContext(ctx, f, .026, .018, "square");
+
+      // Add a very quiet, short second click so the sound has some body
+      // without becoming a continuous hum.
+      if (tick % 3 === 0) {
+        toneWithContext(ctx, f * .72, .018, .008, "triangle", .010);
+      }
+
+      tick += 1;
+
+      // Slight variation keeps it from sounding like an electronic metronome.
+      const nextDelay = 88 + (tick % 4) * 9;
+      tickTimer = window.setTimeout(scheduleTick, nextDelay);
+    };
+
+    // A short initial clack, then the repeating reel ticks.
+    toneWithContext(ctx, 390, .045, .028, "square");
+    tickTimer = window.setTimeout(scheduleTick, 70);
+
     return () => {
       if (stopped) return;
       stopped = true;
-      window.clearInterval(tickTimer);
-
-      const now = ctx.currentTime;
-      try {
-        noiseGain.gain.cancelScheduledValues(now);
-        noiseGain.gain.setValueAtTime(Math.max(.0001, noiseGain.gain.value), now);
-        noiseGain.gain.exponentialRampToValueAtTime(.0001, now + .14);
-        motorGain.gain.cancelScheduledValues(now);
-        motorGain.gain.setValueAtTime(Math.max(.0001, motorGain.gain.value), now);
-        motorGain.gain.exponentialRampToValueAtTime(.0001, now + .14);
-        noise.stop(now + .16);
-        motor.stop(now + .16);
-      } catch (_) {}
+      if (tickTimer !== null) window.clearTimeout(tickTimer);
     };
   }
 
