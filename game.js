@@ -181,12 +181,17 @@
     spinButton.disabled = true;
     spinLabel.textContent = "SPINNING";
     statusText.textContent = "¡buena suerte!";
-    playSpinSound();
+
+    // Unlock WebAudio on the user's button press, then keep the reel sound
+    // running until the final reel has stopped.
+    const ctx = await ensureAudioContext();
+    const stopSpinSound = startSpinSound(ctx);
 
     const result = generateResult();
     incrementStorage(STORAGE_SPINS);
 
     await Promise.all(result.map((target, index) => animateReel(index, target)));
+    stopSpinSound();
 
     const won = isJackpot(result);
     if (won) incrementStorage(STORAGE_WINS);
@@ -256,37 +261,118 @@
     }
   }
 
-  function getAudioContext() {
+  async function ensureAudioContext() {
     if (!config.sounds) return null;
     if (!audioContext) {
       const Ctx = window.AudioContext || window.webkitAudioContext;
       if (!Ctx) return null;
       audioContext = new Ctx();
     }
-    if (audioContext.state === "suspended") audioContext.resume();
+
+    // Browsers often create WebAudio in a suspended state. Resume it directly
+    // from the PLAY button gesture so the spinning sound begins immediately.
+    if (audioContext.state === "suspended") {
+      try { await audioContext.resume(); } catch (_) {}
+    }
     return audioContext;
   }
 
-  function tone(freq, duration, volume = .05, type = "sine", delay = 0) {
-    const ctx = getAudioContext();
-    if (!ctx) return;
+  function getRunningAudioContext() {
+    if (!config.sounds || !audioContext || audioContext.state !== "running") return null;
+    return audioContext;
+  }
+
+  function toneWithContext(ctx, freq, duration, volume = .05, type = "sine", delay = 0) {
+    if (!ctx || ctx.state !== "running") return;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     const start = ctx.currentTime + delay;
+    const safeEnd = start + Math.max(.03, duration);
+
     osc.type = type;
     osc.frequency.setValueAtTime(freq, start);
     gain.gain.setValueAtTime(0.0001, start);
-    gain.gain.exponentialRampToValueAtTime(volume, start + .015);
-    gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+    gain.gain.exponentialRampToValueAtTime(Math.max(.0002, volume), start + .012);
+    gain.gain.exponentialRampToValueAtTime(0.0001, safeEnd);
     osc.connect(gain).connect(ctx.destination);
     osc.start(start);
-    osc.stop(start + duration + .04);
+    osc.stop(safeEnd + .04);
   }
 
-  function playSpinSound() {
-    tone(160, .18, .03, "sawtooth");
-    tone(210, .18, .02, "sawtooth", .08);
+  function tone(freq, duration, volume = .05, type = "sine", delay = 0) {
+    const ctx = getRunningAudioContext();
+    if (!ctx) return;
+    toneWithContext(ctx, freq, duration, volume, type, delay);
   }
+
+  function startSpinSound(ctx) {
+    if (!ctx || ctx.state !== "running") return () => {};
+
+    // Continuous filtered noise gives the reels a mechanical "whirr" for the
+    // entire spin instead of only playing two short tones at the beginning.
+    const bufferLength = Math.max(1, Math.floor(ctx.sampleRate * .35));
+    const noiseBuffer = ctx.createBuffer(1, bufferLength, ctx.sampleRate);
+    const data = noiseBuffer.getChannelData(0);
+    for (let i = 0; i < data.length; i++) {
+      data[i] = (Math.random() * 2 - 1) * .75;
+    }
+
+    const noise = ctx.createBufferSource();
+    noise.buffer = noiseBuffer;
+    noise.loop = true;
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = "bandpass";
+    filter.frequency.setValueAtTime(950, ctx.currentTime);
+    filter.Q.setValueAtTime(.8, ctx.currentTime);
+
+    const noiseGain = ctx.createGain();
+    noiseGain.gain.setValueAtTime(0.0001, ctx.currentTime);
+    noiseGain.gain.exponentialRampToValueAtTime(.032, ctx.currentTime + .06);
+
+    // A quiet low oscillator adds a motor-like undertone.
+    const motor = ctx.createOscillator();
+    const motorGain = ctx.createGain();
+    motor.type = "sawtooth";
+    motor.frequency.setValueAtTime(82, ctx.currentTime);
+    motorGain.gain.setValueAtTime(0.0001, ctx.currentTime);
+    motorGain.gain.exponentialRampToValueAtTime(.012, ctx.currentTime + .06);
+
+    noise.connect(filter).connect(noiseGain).connect(ctx.destination);
+    motor.connect(motorGain).connect(ctx.destination);
+    noise.start();
+    motor.start();
+
+    // Soft repeating clicks make the sound read as spinning reels rather than
+    // a steady background tone. They continue until the last reel stops.
+    let tick = 0;
+    const tickTimer = window.setInterval(() => {
+      if (ctx.state !== "running") return;
+      const frequencies = [520, 590, 555, 625];
+      toneWithContext(ctx, frequencies[tick % frequencies.length], .038, .016, "square");
+      tick += 1;
+    }, 105);
+
+    let stopped = false;
+    return () => {
+      if (stopped) return;
+      stopped = true;
+      window.clearInterval(tickTimer);
+
+      const now = ctx.currentTime;
+      try {
+        noiseGain.gain.cancelScheduledValues(now);
+        noiseGain.gain.setValueAtTime(Math.max(.0001, noiseGain.gain.value), now);
+        noiseGain.gain.exponentialRampToValueAtTime(.0001, now + .14);
+        motorGain.gain.cancelScheduledValues(now);
+        motorGain.gain.setValueAtTime(Math.max(.0001, motorGain.gain.value), now);
+        motorGain.gain.exponentialRampToValueAtTime(.0001, now + .14);
+        noise.stop(now + .16);
+        motor.stop(now + .16);
+      } catch (_) {}
+    };
+  }
+
   function playStopSound(reelIndex) { tone(340 + reelIndex * 55, .09, .06, "square"); }
   function playWinSound() {
     [523, 659, 784, 1047].forEach((f, i) => tone(f, .34, .055, "triangle", i * .11));
@@ -354,6 +440,6 @@
   });
 
   if ("serviceWorker" in navigator && location.protocol !== "file:") {
-    navigator.serviceWorker.register("service-worker.js?v=1.1.0").catch(() => {});
+    navigator.serviceWorker.register("service-worker.js?v=1.7.0").catch(() => {});
   }
 })();
